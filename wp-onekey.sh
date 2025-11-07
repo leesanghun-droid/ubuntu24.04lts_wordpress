@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+umask 022
+
 # --------- Defaults ---------
 SITE_DIR="showdeck"
 DB_NAME="wpdb"
@@ -49,14 +51,46 @@ detect_php_sock(){
   for s in "${candidates[@]}"; do
     [[ -S "$s" ]] && echo "$s" && return 0
   done
-  # 마지막 수단: 버전 알아내서 추정
   local v
   v="$(php -v 2>/dev/null | awk 'NR==1{print $2}' | cut -d'.' -f1-2 || true)"
   if [[ -n "${v:-}" && -S "/run/php/php${v}-fpm.sock" ]]; then
     echo "/run/php/php${v}-fpm.sock"; return 0
   fi
-  # 기본 경로
   echo "/run/php/php8.3-fpm.sock"
+}
+
+need_cmd(){
+  command -v "$1" >/dev/null 2>&1 || die "필요 명령어가 없습니다: $1"
+}
+
+retry(){
+  # retry <times> <sleep> <cmd...>
+  local -r tries="$1"; shift
+  local -r wait="$1"; shift
+  local i=1
+  while true; do
+    if "$@"; then return 0; fi
+    if (( i >= tries )); then return 1; fi
+    sleep "$wait"
+    ((i++))
+  done
+}
+
+mysql_try(){
+  # mysql_try <host> <user> <pass> <sql>
+  local host="$1" user="$2" pass="$3" sql="$4"
+  MYSQL_PWD="$pass" mysql -h "$host" -u "$user" -e "$sql" >/dev/null 2>&1
+}
+
+choose_db_host(){
+  # 실제 접속 가능한 DB_HOST 자동 선택: 127.0.0.1 우선, 실패시 localhost
+  if mysql_try "127.0.0.1" "$DB_USER" "$DB_PASS" "SELECT 1;"; then
+    echo "127.0.0.1"
+  elif mysql_try "localhost" "$DB_USER" "$DB_PASS" "SELECT 1;"; then
+    echo "localhost"
+  else
+    echo ""  # 실패
+  fi
 }
 
 # --------- Begin ---------
@@ -87,9 +121,8 @@ log "MariaDB 설치"
 apt -y install mariadb-server
 systemctl enable --now mariadb
 
-log "PHP(FPM) 설치"
+log "PHP(FPM) + MySQL 모듈 설치"
 apt -y install php-fpm php-mysql php-xml php-curl php-zip php-mbstring php-gd php-intl
-# php-fpm 서비스명 자동 탐색
 if systemctl list-units | grep -q php8.3-fpm; then
   systemctl restart php8.3-fpm
 elif systemctl list-units | grep -q php8.2-fpm; then
@@ -115,6 +148,17 @@ GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${DB_USER}'@'127.0.0.1';
 FLUSH PRIVILEGES;
 SQL
 
+# ---- DB 접속 테스트로 DB_HOST 결정 ----
+log "DB 접속 검사로 DB_HOST 자동 결정"
+CHOSEN_DB_HOST="$(choose_db_host || true)"
+if [[ -z "${CHOSEN_DB_HOST}" ]]; then
+  # 추가 힌트 출력
+  warn "DB 접속 실패: 127.0.0.1 / localhost 모두 실패"
+  warn "mariadb 상태 확인: systemctl status mariadb"
+  die  "DB 연결 불가. 비밀번호/서비스 상태를 확인하세요."
+fi
+log "선택된 DB_HOST: ${CHOSEN_DB_HOST}"
+
 log "워드프레스 다운로드/배치"
 install -d -m 755 /var/www
 cd /var/www
@@ -137,10 +181,19 @@ install -d -o www-data -g www-data -m 775 "/var/www/${SITE_DIR}/wp-content/uploa
 
 log "Nginx 서버블록 생성"
 NGINX_AVAIL="/etc/nginx/sites-available/${SITE_DIR}"
+
+# 기본 서버 여부 결정
+LISTEN_DEFAULT=""
+SERVER_NAME_LINE="server_name ${DOMAIN};"
+if [[ "$DOMAIN" == "_" ]]; then
+  LISTEN_DEFAULT=" default_server"
+  SERVER_NAME_LINE="server_name _;"
+fi
+
 cat > "${NGINX_AVAIL}" <<NGINX
 server {
-    listen 80;
-    server_name ${DOMAIN};
+    listen 80${LISTEN_DEFAULT};
+    ${SERVER_NAME_LINE}
 
     root /var/www/${SITE_DIR};
     index index.php index.html;
@@ -156,7 +209,12 @@ server {
         # fastcgi_param SCRIPT_FILENAME \$realpath_root\$fastcgi_script_name;
     }
 
+    # 업로드 한도(필요시 주석 해제)
     # client_max_body_size 64m;
+
+    # (선택) 기본 gzip
+    gzip on;
+    gzip_types text/plain text/css application/json application/javascript application/xml+rss application/xml text/javascript;
 }
 NGINX
 
@@ -171,21 +229,20 @@ if [[ ! -f wp-config.php ]]; then
   cp wp-config-sample.php wp-config.php
 fi
 
-SALT_BLOCK="$(curl -s https://api.wordpress.org/secret-key/1.1/salt/ || true)"
-# SALT 호출 실패 시 빈 값이어도 동작은 함.
-awk -v dbn="${DB_NAME}" -v dbu="${DB_USER}" -v dbp="${DB_PASS}" -v salt="${SALT_BLOCK//$'\n'/'\n'}" '
+# SALT 재시도 포함
+SALT_BLOCK="$(retry 3 1 curl -fs https://api.wordpress.org/secret-key/1.1/salt/ || true)"
+
+awk -v dbn="${DB_NAME}" -v dbu="${DB_USER}" -v dbp="${DB_PASS}" -v dbh="${CHOSEN_DB_HOST}" -v salt="${SALT_BLOCK//$'\n'/'\n'}" '
   BEGIN{ injected=0 }
   {
     if($0 ~ /define\(.DB_NAME./){ print "define( '\''DB_NAME'\'', '\''" dbn "'\'' );" }
     else if($0 ~ /define\(.DB_USER./){ print "define( '\''DB_USER'\'', '\''" dbu "'\'' );" }
     else if($0 ~ /define\(.DB_PASSWORD./){ print "define( '\''DB_PASSWORD'\'', '\''" dbp "'\'' );" }
-    else if($0 ~ /define\(.DB_HOST./){ print "define( '\''DB_HOST'\'', '\''127.0.0.1'\'' );" }
+    else if($0 ~ /define\(.DB_HOST./){ print "define( '\''DB_HOST'\'', '\''" dbh "'\'' );" }
     else if($0 ~ /define\(.DB_CHARSET./){ print "define( '\''DB_CHARSET'\'', '\''utf8mb4'\'' );" }
     else if(!injected && $0 ~ /Authentication Unique Keys and Salts/){
       print $0
-      if(length(salt)>0){ print salt } else {
-        # salt API 실패 시 기존 줄 유지
-      }
+      if(length(salt)>0){ print salt }
       injected=1
     } else if($0 ~ /define\(.AUTH_KEY.|define\(.SECURE_AUTH_KEY.|define\(.LOGGED_IN_KEY.|define\(.NONCE_KEY.|define\(.AUTH_SALT.|define\(.SECURE_AUTH_SALT.|define\(.LOGGED_IN_SALT.|define\(.NONCE_SALT./){
       if(injected){ next } else { print $0 }
@@ -193,7 +250,6 @@ awk -v dbn="${DB_NAME}" -v dbu="${DB_USER}" -v dbp="${DB_PASS}" -v salt="${SALT_
   }
 ' wp-config.php > wp-config.php.new
 
-# FS_METHOD 추가
 grep -q "FS_METHOD" wp-config.php.new || echo "define( 'FS_METHOD', 'direct' );" >> wp-config.php.new
 
 mv wp-config.php.new wp-config.php
@@ -204,7 +260,6 @@ chmod 640 wp-config.php
 if [[ $WANT_SSL -eq 1 ]]; then
   log "Certbot(SSL) 설치 및 발급"
   apt -y install certbot python3-certbot-nginx
-  # domain 확인
   if [[ "$DOMAIN" == "_" ]]; then
     die "--ssl 을 쓰려면 --domain 에 실제 도메인을 넣어야 합니다."
   fi
@@ -212,15 +267,22 @@ if [[ $WANT_SSL -eq 1 ]]; then
   systemctl reload nginx
 fi
 
-# ---- Final Info ----
+# ---- Quick health checks ----
+PHP_OK=0
+if php -m | grep -qiE 'mysqli|pdo_mysql'; then PHP_OK=1; fi
+
+DB_PING_OK=0
+if mysql_try "${CHOSEN_DB_HOST}" "$DB_USER" "$DB_PASS" "SHOW DATABASES;"; then DB_PING_OK=1; fi
+
 PUB_IPv4="$(curl -s https://ipinfo.io/ip || true)"
+
 log "설치 완료!"
 echo "------------------------------------------------------------"
 echo " 사이트 URL:        http://${DOMAIN:-_}   (도메인 없으면: http://${PUB_IPv4})"
 echo " 웹 루트:           /var/www/${SITE_DIR}"
 echo " Nginx 블록:        /etc/nginx/sites-available/${SITE_DIR}"
 echo " DB 접속:           ${DB_NAME} / ${DB_USER} / ${DB_PASS}"
-echo " DB 호스트:         127.0.0.1"
+echo " DB 호스트:         ${CHOSEN_DB_HOST}"
 echo " 관리자 페이지:     http://${DOMAIN:-$PUB_IPv4}/wp-admin/  (설치 마법사 진행)"
 if [[ $WANT_SSL -eq 1 ]]; then
   echo " SSL:               발급됨 (Let's Encrypt, 자동갱신)"
@@ -228,3 +290,6 @@ fi
 echo " 방화벽:            UFW(22,80,443 허용)"
 echo " PHP-FPM 소켓:      ${PHP_SOCK}"
 echo "------------------------------------------------------------"
+echo "진단 요약:"
+echo " - PHP mysql 모듈:  $([[ $PHP_OK -eq 1 ]] && echo OK || echo '없음(php-mysql 필요)')"
+echo " - DB ping:         $([[ $DB_PING_OK -eq 1 ]] && echo OK || echo '실패(DB_HOST/비번/서비스 확인)')"
